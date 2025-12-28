@@ -102,17 +102,21 @@ def fetch_documents():
     
     # Fetch ALL blogs with full content
     try:
-        with httpx.Client(verify=False, timeout=60) as client:
+        with httpx.Client(verify=False, timeout=120) as client:
             resp = client.get(
                 f"{API_BASE_URL}/blogs/posts",
                 params={
-                    "PagingDto.PageFilter.Size": 1000,  # Get all blogs
-                    "PagingDto.PageFilter.Skip": 0
+                    "PagingDto.PageFilter.Size": 2000,  # Get all blogs (1826+)
+                    "PagingDto.PageFilter.Skip": 0,
+                    "PagingDto.PageFilter.ReturnTotalRecordsCount": "true"
                 },
                 headers=headers
             )
             if resp.status_code == 200:
-                blogs = resp.json().get("data", {}).get("list", [])
+                data = resp.json().get("data", {})
+                blogs = data.get("list", [])
+                total = data.get("totalRecordsCount", len(blogs))
+                
                 for post in blogs:
                     title = post.get("title", "")
                     summary = post.get("summary", "")
@@ -140,7 +144,7 @@ def fetch_documents():
                                 "slug": slug
                             }
                         ))
-                logger.info(f"Fetched {len(blogs)} blogs with full content")
+                logger.info(f"Fetched {len(blogs)}/{total} blogs")
     except Exception as e:
         logger.warning(f"Could not fetch blogs: {e}")
     
