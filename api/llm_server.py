@@ -232,15 +232,27 @@ async def stream_query(query_text: str, session_id: str = "default", use_rag: bo
     import json
     import asyncio
     
+    query_lower = query_text.lower().strip()
+    
+    # Detect general/greeting queries that don't need RAG
+    general_patterns = ['hi', 'hello', 'hey', 'good morning', 'good evening', 'how are you', 
+                        'what can you do', 'who are you', 'help', 'thanks', 'thank you', 
+                        'bye', 'goodbye', 'ok', 'okay', 'yes', 'no', 'sure', "i'm not sure"]
+    
+    is_general = any(query_lower == p or query_lower.startswith(p + ' ') or query_lower.startswith(p + '?') 
+                     for p in general_patterns)
+    
     try:
-        if use_rag and index_store:
+        if is_general:
+            # Use direct LLM for greetings/general chat
+            prompt = f"You are Gamatrain AI, a friendly educational assistant. Respond briefly and helpfully to: {query_text}"
+        elif use_rag and index_store:
             # Get context from RAG
             history = conversation_memory[session_id]
             enhanced_query = query_text
             
             # Handle follow-up
             follow_up_words = ["that", "this", "it", "those", "these"]
-            query_lower = query_text.lower()
             is_follow_up = history and any(word in query_lower.split() for word in follow_up_words)
             
             if is_follow_up:
@@ -255,14 +267,13 @@ async def stream_query(query_text: str, session_id: str = "default", use_rag: bo
             nodes = retriever.retrieve(enhanced_query)
             
             if not nodes or max([n.score for n in nodes]) < SIMILARITY_THRESHOLD:
-                no_info_msg = "I don't have information about that in my knowledge base."
-                yield f"data: {json.dumps({'token': no_info_msg, 'done': True})}\n\n"
-                return
-            
-            # Build context for streaming
-            context = "\n".join([n.text for n in nodes[:3]])
-            
-            prompt = f"""Context information is below.
+                # Fallback to direct LLM instead of "don't know"
+                prompt = f"You are Gamatrain AI, an educational assistant. Answer this question: {query_text}"
+            else:
+                # Build context for streaming
+                context = "\n".join([n.text for n in nodes[:3]])
+                
+                prompt = f"""Context information is below.
 ---------------------
 {context}
 ---------------------
