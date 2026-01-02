@@ -224,7 +224,7 @@ def build_index(documents: List[Document]):
 
 
 # Similarity threshold for RAG
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.65"))  # Lowered from 0.75
 
 
 async def stream_query(query_text: str, session_id: str = "default", use_rag: bool = True):
@@ -233,6 +233,7 @@ async def stream_query(query_text: str, session_id: str = "default", use_rag: bo
     import asyncio
     
     query_lower = query_text.lower().strip()
+    nodes = []  # Initialize nodes to avoid reference error
     
     # Detect general/greeting queries that don't need RAG
     general_patterns = ['hi', 'hello', 'hey', 'good morning', 'good evening', 'how are you', 
@@ -242,42 +243,201 @@ async def stream_query(query_text: str, session_id: str = "default", use_rag: bo
     is_general = any(query_lower == p or query_lower.startswith(p + ' ') or query_lower.startswith(p + '?') 
                      for p in general_patterns)
     
+    # Get conversation history
+    history = conversation_memory[session_id]
+    
+    # Detect follow-up questions - expanded patterns
+    follow_up_words = ["that", "this", "it", "those", "these", "more", "explain", "elaborate", "details", "different", "same", "similar", "compare", "versus", "vs"]
+    follow_up_phrases = ["tell me more", "explain more", "can you explain", "what about", "how about", 
+                         "and what", "also", "continue", "go on", "more details", "more information",
+                         "how is it", "what is the difference", "is it the same", "compared to",
+                         "how does it", "why is it", "when is it", "where is it", "different from"]
+    
+    is_follow_up = history and (
+        any(word in query_lower.split() for word in follow_up_words) or
+        any(phrase in query_lower for phrase in follow_up_phrases)
+    )
+    
     try:
-        if is_general:
+        # First, check if the answer might be in recent conversation history
+        context_from_history = ""
+        if history:
+            # Search for relevant info in previous responses
+            query_keywords = set(query_lower.replace("?", "").replace(".", "").split())
+            query_keywords -= {"is", "are", "the", "a", "an", "does", "do", "has", "have", "what", "how", "can", "you", "tell", "me", "about", "more", "please"}
+            
+            for entry in history[-3:]:  # Check last 3 turns
+                prev_response = entry.get("response", "").lower()
+                # If query keywords appear in previous response, use it as context
+                matches = sum(1 for kw in query_keywords if kw in prev_response and len(kw) > 2)
+                if matches >= 1:
+                    context_from_history = entry.get("response", "")[:800]
+                    logger.info(f"Found relevant context in history: {matches} keyword matches")
+                    break
+        
+        # Check for follow-up phrases FIRST before general check
+        follow_up_phrases_check = ["tell me more", "explain more", "can you explain", "more details", 
+                                   "more information", "go on", "continue", "elaborate"]
+        is_explicit_followup = any(phrase in query_lower for phrase in follow_up_phrases_check)
+        
+        if is_explicit_followup and history:
+            # This is definitely a follow-up, use last conversation directly
+            last_entry = history[-1]
+            last_query = last_entry.get("query", "")
+            last_response = last_entry.get("response", "")[:600]
+            
+            logger.info(f"Explicit follow-up detected. Continuing from: '{last_query[:50]}...'")
+            
+            # Simple prompt to avoid model echoing
+            prompt = f"""Based on this context: {last_response}
+
+Explain more about this topic in detail."""
+            
+            # Stream directly without RAG
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{OLLAMA_BASE_URL}/api/generate",
+                    json={
+                        "model": MODEL_NAME,
+                        "prompt": prompt,
+                        "stream": True
+                    }
+                ) as response:
+                    full_response = ""
+                    async for line in response.aiter_lines():
+                        if line:
+                            try:
+                                data = json.loads(line)
+                                token = data.get("response", "")
+                                done = data.get("done", False)
+                                full_response += token
+                                
+                                yield f"data: {json.dumps({'token': token, 'done': done})}\n\n"
+                                
+                                if done:
+                                    conversation_memory[session_id].append({
+                                        "query": query_text,
+                                        "response": full_response,
+                                        "topic": last_entry.get("topic", last_query)
+                                    })
+                                    if len(conversation_memory[session_id]) > MAX_MEMORY_TURNS:
+                                        conversation_memory[session_id] = conversation_memory[session_id][-MAX_MEMORY_TURNS:]
+                            except json.JSONDecodeError:
+                                continue
+            return
+        
+        if is_general and not is_follow_up:
             # Use direct LLM for greetings/general chat
             prompt = f"You are Gamatrain AI, a friendly educational assistant. Respond briefly and helpfully to: {query_text}"
+        elif context_from_history and not is_general:
+            # Answer based on conversation history
+            logger.info("Using conversation history to answer")
+            prompt = f"""You are Gamatrain AI, an educational assistant.
+
+Based on our previous conversation, here is relevant information:
+{context_from_history}
+
+Now answer this question using the information above: {query_text}
+
+If the information above doesn't contain the answer, say so honestly."""
         elif use_rag and index_store:
-            # Get context from RAG
-            history = conversation_memory[session_id]
             enhanced_query = query_text
             
-            # Handle follow-up
-            follow_up_words = ["that", "this", "it", "those", "these"]
-            is_follow_up = history and any(word in query_lower.split() for word in follow_up_words)
-            
-            if is_follow_up:
-                last_topic = history[-1].get("topic", "")
-                if last_topic:
-                    enhanced_query = query_lower
-                    for word in follow_up_words:
-                        enhanced_query = enhanced_query.replace(f" {word} ", f" {last_topic} ")
+            # Handle follow-up with conversation context
+            if is_follow_up and history:
+                last_entry = history[-1]
+                last_topic = last_entry.get("topic", "")
+                last_query = last_entry.get("query", "")
+                last_response = last_entry.get("response", "")[:600]  # Limit context size
+                
+                # If no topic saved, use the last query as context
+                if not last_topic:
+                    last_topic = last_query
+                
+                logger.info(f"Follow-up detected. Topic: '{last_topic}', Last query: '{last_query}'")
+                
+                # For ALL follow-up questions, use conversation context directly
+                # Use simple prompt format to avoid model echoing the prompt
+                prompt = f"""Based on this context: {last_response}
+
+{query_text}"""
+                
+                # Skip RAG retrieval, go directly to LLM
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{OLLAMA_BASE_URL}/api/generate",
+                        json={
+                            "model": MODEL_NAME,
+                            "prompt": prompt,
+                            "stream": True
+                        }
+                    ) as response:
+                        full_response = ""
+                        async for line in response.aiter_lines():
+                            if line:
+                                try:
+                                    data = json.loads(line)
+                                    token = data.get("response", "")
+                                    done = data.get("done", False)
+                                    full_response += token
+                                    
+                                    yield f"data: {json.dumps({'token': token, 'done': done})}\n\n"
+                                    
+                                    if done:
+                                        # Preserve topic from previous turn
+                                        conversation_memory[session_id].append({
+                                            "query": query_text,
+                                            "response": full_response,
+                                            "topic": last_topic
+                                        })
+                                        
+                                        if len(conversation_memory[session_id]) > MAX_MEMORY_TURNS:
+                                            conversation_memory[session_id] = conversation_memory[session_id][-MAX_MEMORY_TURNS:]
+                                except json.JSONDecodeError:
+                                    continue
+                return  # Exit after handling follow-up
             
             # Retrieve context
             retriever = index_store.as_retriever(similarity_top_k=3)
             nodes = retriever.retrieve(enhanced_query)
             
             if not nodes or max([n.score for n in nodes]) < SIMILARITY_THRESHOLD:
-                # Fallback to direct LLM instead of "don't know"
-                prompt = f"You are Gamatrain AI, an educational assistant. Answer this question: {query_text}"
+                # For follow-ups with no RAG match, use conversation history
+                if is_follow_up and history:
+                    last_entry = history[-1]
+                    prompt = f"""You are Gamatrain AI, an educational assistant.
+
+Previous conversation:
+User asked: {last_entry.get('query', '')}
+You answered: {last_entry.get('response', '')[:500]}
+
+Now the user asks: {query_text}
+
+Please continue the conversation and provide more details based on your previous answer."""
+                else:
+                    prompt = f"You are Gamatrain AI, an educational assistant. Answer this question: {query_text}"
             else:
                 # Build context for streaming
                 context = "\n".join([n.text for n in nodes[:3]])
+                
+                # Include conversation history in prompt for follow-ups
+                history_context = ""
+                if is_follow_up and history:
+                    last_entry = history[-1]
+                    history_context = f"""
+Previous conversation:
+User asked: {last_entry.get('query', '')}
+You answered: {last_entry.get('response', '')[:300]}
+
+"""
                 
                 prompt = f"""Context information is below.
 ---------------------
 {context}
 ---------------------
-IMPORTANT: Answer the question ONLY using the context above.
+{history_context}IMPORTANT: Answer the question using the context above and conversation history.
 If the answer is NOT in the context, say 'I don't have information about that in my knowledge base.'
 Do NOT make up or invent any information.
 
@@ -316,6 +476,9 @@ Answer: """
                                     best_node = max(nodes, key=lambda n: n.score)
                                     if "Blog Title:" in best_node.text:
                                         topic = best_node.text.split("Blog Title:")[1].split("\n")[0].strip()
+                                elif is_follow_up and history:
+                                    # Preserve topic from previous turn
+                                    topic = history[-1].get("topic", "")
                                 
                                 conversation_memory[session_id].append({
                                     "query": query_text,
@@ -342,10 +505,25 @@ def query_with_threshold(query_text: str, session_id: str = "default"):
                         'bye', 'goodbye', 'ok', 'okay', 'yes', 'no', 'sure']
     query_lower = query_text.lower().strip()
     
+    # Build context from conversation history
+    history = conversation_memory[session_id]
+    
+    # Detect follow-up questions - expanded patterns
+    follow_up_words = ["that", "this", "it", "those", "these", "more", "explain", "elaborate", "details", "different", "same", "similar", "compare", "versus", "vs"]
+    follow_up_phrases = ["tell me more", "explain more", "can you explain", "what about", "how about", 
+                         "and what", "also", "continue", "go on", "more details", "more information",
+                         "how is it", "what is the difference", "is it the same", "compared to",
+                         "how does it", "why is it", "when is it", "where is it", "different from"]
+    
+    is_follow_up = history and (
+        any(word in query_lower.split() for word in follow_up_words) or
+        any(phrase in query_lower for phrase in follow_up_phrases)
+    )
+    
     is_general = any(query_lower == p or query_lower.startswith(p + ' ') or query_lower.startswith(p + '?') 
                      for p in general_patterns)
     
-    if is_general:
+    if is_general and not is_follow_up:
         # Use direct LLM for greetings/general chat
         logger.info(f"General query detected, using direct LLM")
         response = llm.complete(f"You are Gamatrain AI, a friendly educational assistant. Respond briefly and helpfully to: {query_text}")
@@ -355,29 +533,102 @@ def query_with_threshold(query_text: str, session_id: str = "default"):
             "max_score": 1.0
         }
     
-    # Build context from conversation history
-    history = conversation_memory[session_id]
+    # Check if the answer might be in recent conversation history
+    context_from_history = ""
+    if history:
+        query_keywords = set(query_lower.replace("?", "").replace(".", "").split())
+        query_keywords -= {"is", "are", "the", "a", "an", "does", "do", "has", "have", "what", "how", "can", "you", "tell", "me", "about"}
+        
+        for entry in history[-3:]:
+            prev_response = entry.get("response", "").lower()
+            matches = sum(1 for kw in query_keywords if kw in prev_response and len(kw) > 2)
+            if matches >= 1:
+                context_from_history = entry.get("response", "")[:800]
+                logger.info(f"Found relevant context in history: {matches} keyword matches")
+                break
+    
+    if context_from_history and not is_general:
+        logger.info("Using conversation history to answer")
+        prompt = f"""You are Gamatrain AI, an educational assistant.
+
+Based on our previous conversation, here is relevant information:
+{context_from_history}
+
+Now answer this question using the information above: {query_text}
+
+If the information above doesn't contain the answer, say so honestly."""
+        response = llm.complete(prompt)
+        
+        # Save to memory
+        conversation_memory[session_id].append({
+            "query": query_text,
+            "response": str(response),
+            "topic": history[-1].get("topic", "") if history else ""
+        })
+        if len(conversation_memory[session_id]) > MAX_MEMORY_TURNS:
+            conversation_memory[session_id] = conversation_memory[session_id][-MAX_MEMORY_TURNS:]
+        
+        return {
+            "response": str(response),
+            "confidence": "from_history",
+            "max_score": 1.0
+        }
     
     # Detect follow-up questions
     enhanced_query = query_text
-    follow_up_words = ["that", "this", "it", "those", "these"]
     
-    is_follow_up = history and any(word in query_lower.split() for word in follow_up_words)
-    
-    if is_follow_up:
-        last_topic = history[-1].get("topic", "")
-        if last_topic:
-            # Replace pronouns with actual topic
-            enhanced_query = query_lower
-            for word in follow_up_words:
-                # Replace whole word only
-                enhanced_query = enhanced_query.replace(f" {word} ", f" {last_topic} ")
-                enhanced_query = enhanced_query.replace(f" {word}?", f" {last_topic}?")
-                enhanced_query = enhanced_query.replace(f" {word}.", f" {last_topic}.")
-                if enhanced_query.endswith(f" {word}"):
-                    enhanced_query = enhanced_query[:-len(word)-1] + f" {last_topic}"
+    if is_follow_up and history:
+        last_entry = history[-1]
+        last_topic = last_entry.get("topic", "")
+        last_query = last_entry.get("query", "")
+        last_response = last_entry.get("response", "")[:500]
+        
+        # If no topic saved, use the last query as context
+        if not last_topic:
+            last_topic = last_query
+        
+        logger.info(f"Follow-up detected. Topic: '{last_topic}', Last query: '{last_query}'")
+        
+        # For "explain more" type queries, use conversation context directly
+        if any(phrase in query_lower for phrase in ["explain more", "tell me more", "more details", "can you explain"]):
+            prompt = f"""You are Gamatrain AI, an educational assistant.
+
+Previous conversation:
+User asked: {last_query}
+You answered: {last_response}
+
+Now the user asks: {query_text}
+
+Please provide more details and expand on your previous answer. Be helpful and informative."""
+            response = llm.complete(prompt)
             
-            logger.info(f"Follow-up detected. Topic: '{last_topic}', Enhanced: '{enhanced_query}'")
+            # Save to conversation memory
+            conversation_memory[session_id].append({
+                "query": query_text,
+                "enhanced_query": query_text,
+                "response": str(response),
+                "topic": last_topic
+            })
+            
+            if len(conversation_memory[session_id]) > MAX_MEMORY_TURNS:
+                conversation_memory[session_id] = conversation_memory[session_id][-MAX_MEMORY_TURNS:]
+            
+            return {
+                "response": str(response),
+                "confidence": "follow_up",
+                "max_score": 1.0
+            }
+        
+        # For other follow-ups, try to enhance the query
+        enhanced_query = query_lower
+        for word in ["that", "this", "it", "those", "these"]:
+            enhanced_query = enhanced_query.replace(f" {word} ", f" {last_topic} ")
+            enhanced_query = enhanced_query.replace(f" {word}?", f" {last_topic}?")
+            enhanced_query = enhanced_query.replace(f" {word}.", f" {last_topic}.")
+            if enhanced_query.endswith(f" {word}"):
+                enhanced_query = enhanced_query[:-len(word)-1] + f" {last_topic}"
+        
+        logger.info(f"Enhanced query: '{enhanced_query}'")
     
     # Get retriever to check similarity scores
     retriever = index_store.as_retriever(similarity_top_k=5)
@@ -397,8 +648,21 @@ def query_with_threshold(query_text: str, session_id: str = "default"):
     # Check if score meets threshold
     if max_score < SIMILARITY_THRESHOLD:
         logger.info(f"Low similarity score ({max_score:.2f}), falling back to direct LLM")
-        # Fallback to direct LLM instead of "don't know"
-        response = llm.complete(f"You are Gamatrain AI, an educational assistant. Answer this question: {query_text}")
+        # For follow-ups with no RAG match, use conversation history
+        if is_follow_up and history:
+            last_entry = history[-1]
+            prompt = f"""You are Gamatrain AI, an educational assistant.
+
+Previous conversation:
+User asked: {last_entry.get('query', '')}
+You answered: {last_entry.get('response', '')[:500]}
+
+Now the user asks: {query_text}
+
+Please continue the conversation and provide more details based on your previous answer."""
+            response = llm.complete(prompt)
+        else:
+            response = llm.complete(f"You are Gamatrain AI, an educational assistant. Answer this question: {query_text}")
         return {
             "response": str(response),
             "confidence": "low",
@@ -433,6 +697,10 @@ def query_with_threshold(query_text: str, session_id: str = "default"):
         best_node = max(nodes, key=lambda n: n.score)
         if "Blog Title:" in best_node.text:
             topic = best_node.text.split("Blog Title:")[1].split("\n")[0].strip()
+    
+    # Preserve topic from previous turn if no new topic found
+    if not topic and is_follow_up and history:
+        topic = history[-1].get("topic", "")
     
     # Save to conversation memory
     conversation_memory[session_id].append({
