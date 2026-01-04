@@ -301,7 +301,10 @@ Explain more about this topic in detail."""
                     json={
                         "model": MODEL_NAME,
                         "prompt": prompt,
-                        "stream": True
+                        "stream": True,
+                        "options": {
+                            "num_predict": 1024  # Max tokens to generate
+                        }
                     }
                 ) as response:
                     full_response = ""
@@ -371,7 +374,10 @@ If the information above doesn't contain the answer, say so honestly."""
                         json={
                             "model": MODEL_NAME,
                             "prompt": prompt,
-                            "stream": True
+                            "stream": True,
+                            "options": {
+                                "num_predict": 1024
+                            }
                         }
                     ) as response:
                         full_response = ""
@@ -455,7 +461,10 @@ Answer: """
                 json={
                     "model": MODEL_NAME,
                     "prompt": prompt,
-                    "stream": True
+                    "stream": True,
+                    "options": {
+                        "num_predict": 1024
+                    }
                 }
             ) as response:
                 full_response = ""
