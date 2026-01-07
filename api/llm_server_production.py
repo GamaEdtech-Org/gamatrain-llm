@@ -60,7 +60,7 @@ STORAGE_DIR = os.getenv("STORAGE_DIR", "./storage")
 CUSTOM_DOCS_PATH = os.getenv("CUSTOM_DOCS_PATH", "../data/custom_docs.json")
 
 # Gamatrain API for fetching documents
-API_BASE_URL = os.getenv("GAMATRAIN_API_URL", "https://185.204.170.142/api/v1")
+API_BASE_URL = os.getenv("GAMATRAIN_API_URL", "https://api.gamaedtech.com/api/v1")
 AUTH_TOKEN = os.getenv("GAMATRAIN_AUTH_TOKEN", "")
 
 # RAG Settings
@@ -339,24 +339,53 @@ def fetch_documents():
     except Exception as e:
         logger.warning(f"Could not fetch blogs: {e}")
     
-    # Fetch schools
+    # Fetch schools (get 10000 schools with pagination)
     try:
-        with httpx.Client(verify=False, timeout=30) as client:
-            resp = client.get(
-                f"{API_BASE_URL}/schools",
-                params={"PagingDto.PageFilter.Size": 100, "PagingDto.PageFilter.Skip": 0},
-                headers=headers
-            )
-            if resp.status_code == 200:
-                schools = resp.json().get("data", {}).get("list", [])
-                for school in schools:
-                    name = school.get("name", "")
-                    if name and "gamatrain" not in name.lower():
-                        documents.append(Document(
-                            text=f"School: {name}\nCity: {school.get('cityTitle', '')}\nCountry: {school.get('countryTitle', '')}",
-                            metadata={"type": "school", "id": str(school.get("id"))}
-                        ))
-                logger.info(f"Fetched {len(schools)} schools")
+        all_schools = []
+        batch_size = 1000
+        max_schools = 10000
+        
+        with httpx.Client(verify=False, timeout=120) as client:
+            for skip in range(0, max_schools, batch_size):
+                resp = client.get(
+                    f"{API_BASE_URL}/schools",
+                    params={"PagingDto.PageFilter.Size": batch_size, "PagingDto.PageFilter.Skip": skip},
+                    headers=headers
+                )
+                if resp.status_code == 200:
+                    schools = resp.json().get("data", {}).get("list", [])
+                    if not schools:
+                        break
+                    all_schools.extend(schools)
+                    logger.info(f"Fetched {len(all_schools)} schools...")
+                else:
+                    break
+        
+        for school in all_schools:
+            name = school.get("name", "")
+            if name and "gamatrain" not in name.lower():
+                # Build comprehensive school text
+                school_text = f"School Name: {name}"
+                if school.get("cityTitle"):
+                    school_text += f"\nCity: {school['cityTitle']}"
+                if school.get("stateTitle"):
+                    school_text += f"\nState/Province: {school['stateTitle']}"
+                if school.get("countryTitle"):
+                    school_text += f"\nCountry: {school['countryTitle']}"
+                if school.get("score"):
+                    school_text += f"\nRating Score: {school['score']} out of 5 stars"
+                if school.get("slug"):
+                    school_text += f"\nURL: /schools/{school['slug']}"
+                
+                documents.append(Document(
+                    text=school_text,
+                    metadata={
+                        "type": "school",
+                        "id": str(school.get("id")),
+                        "slug": school.get("slug", "")
+                    }
+                ))
+        logger.info(f"Total schools indexed: {len(all_schools)}")
     except Exception as e:
         logger.warning(f"Could not fetch schools: {e}")
     
@@ -387,6 +416,59 @@ def build_index(documents: List[Document]):
     logger.info("Index built and saved")
 
 
+async def rewrite_query_with_context(query: str, history: list) -> tuple:
+    """Rewrite follow-up questions to include context. Returns (rewritten_query, is_follow_up)."""
+    if not history:
+        return query, False
+    
+    query_lower = query.lower().strip()
+    
+    # Check for follow-up indicators
+    follow_up_words = ["it", "its", "this", "that", "they", "their", "there", "here"]
+    
+    # Check if query contains follow-up words as separate words
+    query_words = query_lower.replace("?", " ").replace(".", " ").split()
+    has_follow_up = any(word in query_words for word in follow_up_words)
+    
+    if not has_follow_up:
+        return query, False
+    
+    # Get the last topic
+    last_entry = history[-1]
+    last_topic = last_entry.get("topic", "")
+    
+    if not last_topic:
+        # Try to extract from last query
+        last_query = last_entry.get("query", "")
+        # Simple extraction: look for capitalized words
+        words = last_query.split()
+        topic_words = [w for w in words if w[0].isupper() and len(w) > 2] if words else []
+        if topic_words:
+            last_topic = " ".join(topic_words[:4])  # Max 4 words
+    
+    if not last_topic:
+        return query, False
+    
+    # Rewrite the query by replacing pronouns with the topic
+    rewritten = query
+    replacements = [
+        (" it ", f" {last_topic} "),
+        (" it?", f" {last_topic}?"),
+        (" its ", f" {last_topic}'s "),
+        ("does it ", f"does {last_topic} "),
+        ("is it ", f"is {last_topic} "),
+        ("what is it", f"what is {last_topic}"),
+    ]
+    
+    for old, new in replacements:
+        if old in query_lower:
+            rewritten = query_lower.replace(old, new)
+            break
+    
+    logger.info(f"Query rewritten: '{query}' -> '{rewritten}' (topic: {last_topic})")
+    return rewritten, True
+
+
 # =============================================================================
 # Query Processing (with RAG + Memory + Follow-up)
 # =============================================================================
@@ -397,41 +479,27 @@ async def process_query(query_text: str, session_id: str = "default", use_rag: b
     query_lower = query_text.lower().strip()
     history = conversation_memory[session_id]
     
-    # Detect follow-up questions
-    follow_up_words = ["that", "this", "it", "those", "these", "more", "explain", "elaborate", 
-                       "details", "different", "same", "similar", "compare"]
-    follow_up_phrases = ["tell me more", "explain more", "can you explain", "what about", 
-                         "how about", "more details", "how is it", "different from"]
-    
-    is_follow_up = history and (
-        any(word in query_lower.split() for word in follow_up_words) or
-        any(phrase in query_lower for phrase in follow_up_phrases)
-    )
-    
-    # Detect general greetings
+    # Detect general greetings (no rewrite needed)
     general_patterns = ['hi', 'hello', 'hey', 'good morning', 'how are you', 
                         'what can you do', 'who are you', 'thanks', 'bye']
     is_general = any(query_lower == p or query_lower.startswith(p + ' ') for p in general_patterns)
     
-    # Build prompt based on context
-    if is_general and not is_follow_up:
+    if is_general:
         prompt = f"You are Gamatrain AI, a friendly educational assistant. Respond briefly: {query_text}"
         return prompt, None
     
-    # Handle follow-up questions
-    if is_follow_up and history:
-        last_entry = history[-1]
-        last_response = last_entry.get("response", "")[:600]
-        
-        prompt = f"""Based on this context: {last_response}
-
-{query_text}"""
-        return prompt, last_entry.get("topic", "")
+    # Use LLM to rewrite query if there's conversation history
+    search_query = query_text
+    is_follow_up = False
+    if history:
+        search_query, is_follow_up = await rewrite_query_with_context(query_text, history)
     
-    # Use RAG for new questions
+    logger.info(f"Query: {query_text}, Rewritten: {search_query}, Follow-up: {is_follow_up}")
+    
+    # Use RAG with the rewritten query
     if use_rag and index_store:
         retriever = index_store.as_retriever(similarity_top_k=3)
-        nodes = retriever.retrieve(query_text)
+        nodes = retriever.retrieve(search_query)  # Use rewritten query for search
         
         if nodes and max([n.score for n in nodes]) >= SIMILARITY_THRESHOLD:
             context = "\n".join([n.text for n in nodes[:3]])
@@ -441,13 +509,15 @@ async def process_query(query_text: str, session_id: str = "default", use_rag: b
 
 Question: {query_text}
 
-Answer based on the context above. If the answer is not in the context, say so."""
+Answer based on the context above. Be specific and include exact numbers if available (like scores, ratings, etc.). If the answer is not in the context, say so."""
             
-            # Extract topic
+            # Extract topic (for blogs and schools)
             topic = ""
             best_node = max(nodes, key=lambda n: n.score)
             if "Blog Title:" in best_node.text:
                 topic = best_node.text.split("Blog Title:")[1].split("\n")[0].strip()
+            elif "School Name:" in best_node.text:
+                topic = best_node.text.split("School Name:")[1].split("\n")[0].strip()
             
             return prompt, topic
     

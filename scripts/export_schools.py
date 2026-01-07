@@ -10,7 +10,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configuration - Update these values
-API_BASE_URL = "https://your-api-url/api/v1"  # Update with correct URL
+API_BASE_URL = "https://api.gamaedtech.com/api/v1"
 AUTH_TOKEN = ""  # Add your token if needed
 
 OUTPUT_FILE = "../data/custom_docs.json"

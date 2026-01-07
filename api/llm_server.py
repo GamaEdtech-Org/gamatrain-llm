@@ -40,7 +40,7 @@ STORAGE_DIR = os.getenv("STORAGE_DIR", "./storage")
 CUSTOM_DOCS_PATH = os.getenv("CUSTOM_DOCS_PATH", "../data/custom_docs.json")
 
 # Gamatrain API
-API_BASE_URL = os.getenv("GAMATRAIN_API_URL", "https://185.204.170.142/api/v1")
+API_BASE_URL = os.getenv("GAMATRAIN_API_URL", "https://api.gamaedtech.com/api/v1")
 AUTH_TOKEN = os.getenv("GAMATRAIN_AUTH_TOKEN", "")
 
 # Logging
@@ -149,22 +149,39 @@ def fetch_documents():
     except Exception as e:
         logger.warning(f"Could not fetch blogs: {e}")
     
-    # Fetch schools
+    # Fetch schools (get more schools with detailed info)
     try:
-        with httpx.Client(verify=False, timeout=30) as client:
+        with httpx.Client(verify=False, timeout=60) as client:
             resp = client.get(
                 f"{API_BASE_URL}/schools",
-                params={"PagingDto.PageFilter.Size": 50, "PagingDto.PageFilter.Skip": 0},
+                params={"PagingDto.PageFilter.Size": 1000, "PagingDto.PageFilter.Skip": 0},
                 headers=headers
             )
             if resp.status_code == 200:
                 schools = resp.json().get("data", {}).get("list", [])
-                for school in schools[:30]:
+                for school in schools:
                     name = school.get("name", "")
                     if name and "gamatrain" not in name.lower():
+                        # Build comprehensive school text
+                        school_text = f"School Name: {name}"
+                        if school.get("cityTitle"):
+                            school_text += f"\nCity: {school['cityTitle']}"
+                        if school.get("stateTitle"):
+                            school_text += f"\nState/Province: {school['stateTitle']}"
+                        if school.get("countryTitle"):
+                            school_text += f"\nCountry: {school['countryTitle']}"
+                        if school.get("score"):
+                            school_text += f"\nRating: {school['score']}/5"
+                        if school.get("slug"):
+                            school_text += f"\nURL: /schools/{school['slug']}"
+                        
                         documents.append(Document(
-                            text=f"School: {name}\nCity: {school.get('cityTitle', '')}\nCountry: {school.get('countryTitle', '')}",
-                            metadata={"type": "school", "id": str(school.get("id"))}
+                            text=school_text,
+                            metadata={
+                                "type": "school",
+                                "id": str(school.get("id")),
+                                "slug": school.get("slug", "")
+                            }
                         ))
                 logger.info(f"Fetched {len(schools)} schools")
     except Exception as e:

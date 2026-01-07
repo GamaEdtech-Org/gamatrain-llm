@@ -18,7 +18,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configuration
-API_BASE_URL = "https://185.204.170.142/api/v1"
+API_BASE_URL = "https://api.gamaedtech.com/api/v1"
 MODEL_API_URL = "http://localhost:8000/v1/query"
 NUM_BLOGS = 20
 
