@@ -57,7 +57,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instru
 
 # Server Settings
 HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "8001"))
+PORT = int(os.getenv("PORT", "8000"))
 STORAGE_DIR = os.getenv("STORAGE_DIR", "./storage")
 CUSTOM_DOCS_PATH = os.getenv("CUSTOM_DOCS_PATH", "../data/custom_docs.json")
 
@@ -323,6 +323,7 @@ def fetch_documents():
                     title = post.get("title", "")
                     summary = post.get("summary", "")
                     content = post.get("content", "")
+                    slug = post.get("slug", "")  # Extract slug from post
                     
                     if title:
                         import re
@@ -335,7 +336,11 @@ def fetch_documents():
                         
                         documents.append(Document(
                             text=blog_text,
-                            metadata={"type": "blog", "id": str(post.get("id"))}
+                            metadata={
+                                "type": "blog",
+                                "id": str(post.get("id")),
+                                "slug": slug
+                            }
                         ))
                 logger.info(f"Fetched {len(blogs)} blogs")
     except Exception as e:
@@ -513,6 +518,8 @@ def extract_source_links(nodes, base_url: str = "https://gamatrain.com"):
         if doc_type == "blog":
             slug = metadata.get("slug", "")
             blog_id = metadata.get("id", "")
+            
+            # CRITICAL: Only add source if BOTH slug and blog_id exist
             if slug and blog_id:
                 # Extract title from text
                 text = node.text
@@ -527,8 +534,14 @@ def extract_source_links(nodes, base_url: str = "https://gamatrain.com"):
                     "url": f"{base_url}/blog/{blog_id}/{slug}",
                     "score": round(node.score, 3)
                 })
+            else:
+                # Log missing metadata to help debug
+                logger.warning(f"Blog node missing slug or id: slug={slug}, id={blog_id}")
+                
         elif doc_type == "school":
             slug = metadata.get("slug", "")
+            
+            # CRITICAL: Only add source if slug exists
             if slug:
                 # Extract school name
                 text = node.text
@@ -542,6 +555,8 @@ def extract_source_links(nodes, base_url: str = "https://gamatrain.com"):
                     "url": f"{base_url}/schools/{slug}",
                     "score": round(node.score, 3)
                 })
+            else:
+                logger.warning(f"School node missing slug")
     
     return sources
 
@@ -710,9 +725,41 @@ async def stream_query(query_text: str, session_id: str = "default", use_rag: bo
             retriever = index_store.as_retriever(similarity_top_k=3)
             nodes = retriever.retrieve(query_text)
             if nodes and max([n.score for n in nodes]) >= SIMILARITY_THRESHOLD:
-                sources = extract_source_links(nodes)
-        except:
-            pass
+                # Extract sources, but filter out irrelevant ones
+                all_sources = extract_source_links(nodes)
+                
+                # Smart filtering: prioritize blogs over schools for educational content
+                blog_sources = [s for s in all_sources if s["type"] == "blog"]
+                school_sources = [s for s in all_sources if s["type"] == "school"]
+                
+                # For "what is gamatrain" type questions, only show company/blog sources
+                query_about_gamatrain = "gamatrain" in query_text.lower() and any(
+                    word in query_text.lower() for word in ["what", "who", "tell", "about", "explain"]
+                )
+                
+                # For school search queries (looking for specific schools)
+                school_search_keywords = ["school", "university", "college", "academy", "institute", "مدرسه", "دانشگاه"]
+                is_school_search = any(keyword in query_text.lower() for keyword in school_search_keywords)
+                
+                if query_about_gamatrain:
+                    # Only blogs for gamatrain questions
+                    sources = blog_sources
+                    logger.info(f"Gamatrain query: showing {len(sources)} blog sources")
+                elif is_school_search:
+                    # User is looking for schools, show school sources
+                    sources = school_sources
+                    logger.info(f"School search: showing {len(sources)} school sources")
+                elif blog_sources:
+                    # For educational content, prefer blogs over schools
+                    sources = blog_sources
+                    logger.info(f"Educational query: showing {len(sources)} blog sources (filtered out {len(school_sources)} schools)")
+                else:
+                    # No blogs found, show schools as fallback
+                    sources = school_sources
+                    logger.info(f"No blogs found, showing {len(sources)} school sources")
+        except Exception as e:
+            logger.error(f"Error extracting sources: {e}")
+            sources = []
     
     # Stream from HuggingFace
     full_response = ""
