@@ -826,6 +826,12 @@ class QueryRequest(BaseModel):
     stream: bool = True
 
 
+class RegenerateRequest(BaseModel):
+    session_id: str = "default"
+    use_rag: bool = True
+    stream: bool = True
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -932,6 +938,58 @@ async def clear_session(session_id: str):
         del conversation_memory[session_id]
         return {"status": "success", "message": f"Session {session_id} cleared"}
     return {"status": "not_found"}
+
+
+@app.post("/v1/regenerate")
+async def regenerate_response(request: RegenerateRequest):
+    """Regenerate the last response for a session."""
+    global conversation_memory
+    
+    session_id = request.session_id
+    
+    # Check if session exists and has history
+    if session_id not in conversation_memory or not conversation_memory[session_id]:
+        raise HTTPException(status_code=404, detail="No conversation history found for this session")
+    
+    # Get the last user query
+    last_entry = conversation_memory[session_id][-1]
+    last_query = last_entry.get("query", "")
+    
+    if not last_query:
+        raise HTTPException(status_code=400, detail="No query found in conversation history")
+    
+    # Remove the last response from memory
+    conversation_memory[session_id].pop()
+    
+    # Generate new response using the same query
+    if request.stream:
+        return StreamingResponse(
+            stream_query(last_query, session_id, request.use_rag),
+            media_type="text/event-stream"
+        )
+    
+    # Non-streaming response
+    prompt, topic = await process_query(last_query, session_id, request.use_rag)
+    response_text = await call_llm_api(prompt, MAX_TOKENS)
+    
+    # Save to memory
+    conversation_memory[session_id].append({
+        "query": last_query,
+        "response": response_text,
+        "topic": topic or last_query,
+        "sources": []
+    })
+    
+    return {
+        "id": "chatcmpl-gamatrain-regenerate",
+        "object": "chat.completion",
+        "model": GROQ_MODEL if PROVIDER == "groq" else OPENROUTER_MODEL,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": response_text},
+            "finish_reason": "stop"
+        }]
+    }
 
 
 @app.post("/v1/refresh")

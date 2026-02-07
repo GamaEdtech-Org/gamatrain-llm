@@ -945,6 +945,11 @@ class QueryRequest(BaseModel):
     session_id: str = "default"
     stream: bool = False  # Enable streaming
 
+class RegenerateRequest(BaseModel):
+    session_id: str = "default"
+    use_rag: bool = True
+    stream: bool = False
+
 class RefreshRequest(BaseModel):
     force: bool = False
 
@@ -1149,6 +1154,44 @@ async def clear_session(session_id: str):
         del conversation_memory[session_id]
         return {"status": "success", "message": f"Session {session_id} cleared"}
     return {"status": "not_found", "message": f"Session {session_id} not found"}
+
+
+@app.post("/v1/regenerate")
+async def regenerate_response(request: RegenerateRequest):
+    """Regenerate the last response for a session."""
+    global conversation_memory
+    
+    session_id = request.session_id
+    
+    # Check if session exists and has history
+    if session_id not in conversation_memory or not conversation_memory[session_id]:
+        raise HTTPException(status_code=404, detail="No conversation history found for this session")
+    
+    # Get the last user query
+    last_entry = conversation_memory[session_id][-1]
+    last_query = last_entry.get("query", "")
+    
+    if not last_query:
+        raise HTTPException(status_code=400, detail="No query found in conversation history")
+    
+    # Remove the last response from memory
+    conversation_memory[session_id].pop()
+    
+    # Generate new response using the same query
+    if request.stream:
+        return StreamingResponse(
+            stream_query(last_query, session_id, request.use_rag),
+            media_type="text/event-stream"
+        )
+    
+    # Non-streaming response (fallback)
+    result = query_with_threshold(last_query, session_id)
+    
+    return {
+        "response": result["response"],
+        "sources": result.get("sources", []),
+        "session_id": session_id
+    }
 
 
 @app.get("/v1/stream")
