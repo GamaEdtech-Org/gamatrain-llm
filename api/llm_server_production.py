@@ -45,8 +45,7 @@ PROVIDER = os.getenv("PROVIDER", "ollama")  # ollama, groq, openrouter
 
 # Ollama Settings (LOCAL - no internet needed)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gamatrain-qwen")  # Your fine-tuned model
-
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gamatrain-qwen")  
 # Groq Settings (FREE and FAST!)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
