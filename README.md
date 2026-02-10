@@ -1,6 +1,6 @@
 # Gamatrain AI - Educational LLM with RAG 🤖
 
-Fine-tuned LLM (Qwen2-1.5B) with RAG-powered API for Gamatrain's educational platform.
+Fine-tuned LLM (Qwen2.5-7B) with RAG-powered API for Gamatrain's educational platform.
 
 ## 🎯 Overview
 
@@ -14,10 +14,11 @@ An AI assistant that:
 
 | Feature | Description |
 |---------|-------------|
-| **Fine-tuned LLM** | Qwen2-1.5B trained on Gamatrain content |
+| **Fine-tuned LLM** | Qwen2.5-7B trained on Gamatrain content |
 | **RAG Integration** | LlamaIndex-powered retrieval from 2000+ blogs |
 | **Anti-Hallucination** | Similarity threshold + entity verification |
 | **Conversation Memory** | Remembers context for follow-up questions |
+| **Educational Format** | Structured teaching responses with concept explanation, examples, and comprehension checks |
 | **OpenAI-Compatible API** | Drop-in replacement for OpenAI endpoints |
 | **Multi-Provider** | Supports Ollama (local), Groq, OpenRouter |
 
@@ -25,7 +26,7 @@ An AI assistant that:
 
 | Metric | Value |
 |--------|-------|
-| Base Model | Qwen2-1.5B-Instruct |
+| Base Model | Qwen2.5-7B-Instruct |
 | Training Dataset | 2,614 samples |
 | Domain Data | 2,422 (Gamatrain blogs, tests, courses) |
 | General Data | 192 (math, logic, chat - weighted 4x) |
@@ -36,29 +37,37 @@ An AI assistant that:
 
 ```
 gamatrain-ai-research/
-├── api/
+├── api/                           # API Server
 │   ├── llm_server.py              # Development server (Ollama)
 │   ├── llm_server_production.py   # Production server (Groq/OpenRouter)
-│   ├── requirements.txt
-│   └── requirements-production.txt
-├── data/
+│   ├── requirements.txt           # Development dependencies
+│   ├── requirements-production.txt # Production dependencies
+│   └── .env.production.example    # Environment template
+├── data/                          # Training & RAG Data
 │   ├── custom_docs.json           # Custom RAG documents
-│   ├── gamatrain_final_dataset.jsonl
-│   └── scripts/                   # Data extraction scripts
+│   ├── gamatrain_final_dataset.jsonl # Final training dataset
+│   ├── gamatrain_finetune_data.jsonl # Fine-tuning data
+│   ├── general_knowledge.jsonl    # General knowledge samples
+│   └── scripts/                   # Data processing scripts
 ├── model/
-│   ├── Modelfile                  # Ollama configuration
-│   └── README.md                  # Model download instructions
-├── scripts/
+│   └── Modelfile                  # Ollama model configuration
+├── scripts/                       # Testing & Utility Scripts
 │   ├── test_model_and_rag.py      # Main test suite
-│   └── test_random_blogs.py       # Random blog RAG tests
+│   ├── test_random_blogs.py       # Random blog RAG tests
+│   └── rebuild_index.py           # Index rebuilding utility
 ├── notebooks/
 │   └── fine-tuning-complete.ipynb # Training notebook (Colab)
-├── docs/
-│   ├── DEPLOYMENT.md
-│   ├── RESEARCH.md
-│   └── TRAINING.md
-├── docker-compose.production.yml
-└── Dockerfile.production
+├── docs/                          # Documentation
+│   ├── DEPLOYMENT.md              # Basic deployment guide
+│   ├── PRODUCTION.md              # Production deployment guide
+│   ├── RESEARCH.md                # Research findings
+│   └── TRAINING.md                # Fine-tuning guide
+├── storage/                       # RAG Index Storage
+│   ├── faiss_index.bin           # FAISS vector index
+│   ├── documents.json            # Document store
+│   └── metadata.json             # Index metadata
+├── docker-compose.production.yml  # Production Docker setup
+└── Dockerfile.production          # Production Docker image
 ```
 
 
@@ -72,7 +81,7 @@ curl -fsSL https://ollama.ai/install.sh | sh
 
 # 2. Import the fine-tuned model
 cd model/
-# Place qwen2-gamatrain.gguf here (see model/README.md)
+# Place qwen2.5-gamatrain.gguf here (see model/README.md)
 ollama create gamatrain-qwen -f Modelfile
 
 # 3. Start the API server
@@ -150,7 +159,7 @@ curl -X POST http://localhost:8000/v1/refresh
 | `PROVIDER` | ollama | LLM provider: `ollama`, `groq`, `openrouter` |
 | `GROQ_API_KEY` | - | Groq API key (free tier available) |
 | `GROQ_MODEL` | llama-3.1-8b-instant | Model to use with Groq |
-| `OLLAMA_MODEL` | gamatrain-qwen | Local Ollama model name |
+| `OLLAMA_MODEL` | gamatrain-qwen | Local Ollama model name (Qwen2.5-7B based) |
 | `SIMILARITY_THRESHOLD` | 0.45 | RAG confidence threshold |
 | `MAX_TOKENS` | 1024 | Maximum response tokens |
 | `PORT` | 8000/8001 | Server port |
@@ -166,7 +175,7 @@ The system prevents made-up responses through:
 ## 🧪 Running Tests
 
 ```bash
-# Main test suite
+# Main test suite (RAG + Model)
 python scripts/test_model_and_rag.py
 
 # Random blog RAG tests
@@ -179,6 +188,30 @@ python scripts/test_random_blogs.py
 - [DEPLOYMENT.md](docs/DEPLOYMENT.md) - Basic deployment guide
 - [TRAINING.md](docs/TRAINING.md) - Fine-tuning guide
 - [RESEARCH.md](docs/RESEARCH.md) - Research findings
+
+## 📈 Version History
+
+### v1.1 (Current - Commit 87b2d3e)
+- ✅ **Model Upgrade**: Upgraded to Qwen2.5-7B-Instruct for better performance
+- ✅ **Enhanced Teaching Format**: Structured educational response format
+- ✅ Fine-tuned model with 2,614 training samples
+- ✅ RAG system with 2000+ blog documents
+- ✅ Conversation memory and follow-up question handling
+- ✅ Anti-hallucination with similarity thresholds
+- ✅ Multi-provider support (Ollama, Groq, OpenRouter)
+- ✅ Comprehensive test suite with 92.9% pass rate
+- ✅ Production-ready Docker deployment
+
+### v1.0 (Previous)
+- ✅ Initial release with Qwen2-1.5B model
+- ✅ Basic RAG and conversation memory
+
+### v2.0 (In Development)
+- 🚧 Modular architecture with separate components
+- 🚧 Source citation and automatic linking
+- 🚧 Response regeneration endpoint
+- 🚧 Enhanced RAG techniques
+- 🚧 Extended test coverage
 
 ## ⚠️ Key Learning: Catastrophic Forgetting
 
