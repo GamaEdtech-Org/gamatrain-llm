@@ -24,10 +24,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from llama_index.core import VectorStoreIndex, Document, Settings, StorageContext, load_index_from_storage
+from llama_index.core import VectorStoreIndex, Document, StorageContext, load_index_from_storage
 from llama_index.core.prompts import PromptTemplate
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+# Global embedding model
+embed_model = None
 
 # =============================================================================
 # Configuration
@@ -63,12 +66,11 @@ MAX_MEMORY_TURNS = 5  # Keep last 5 Q&A pairs
 # =============================================================================
 def setup_llm():
     """Initialize LLM and embedding model."""
-    global llm
+    global llm, embed_model
     logger.info(f"Setting up LLM: {MODEL_NAME}")
     
     llm = Ollama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, request_timeout=120.0)
-    Settings.llm = llm
-    Settings.embed_model = HuggingFaceEmbedding(model_name="intfloat/multilingual-e5-large")
+    embed_model = HuggingFaceEmbedding(model_name="intfloat/multilingual-e5-large")
     
     return llm
 
@@ -217,6 +219,7 @@ def build_index(documents: List[Document]):
                 similarity_top_k=3,
                 response_mode="compact",
                 text_qa_template=qa_prompt,
+                llm=llm,
             )
             logger.info("Index loaded successfully")
             return query_engine
@@ -225,7 +228,7 @@ def build_index(documents: List[Document]):
     
     # Build new index
     logger.info(f"Building new index with {len(documents)} documents...")
-    index_store = VectorStoreIndex.from_documents(documents)
+    index_store = VectorStoreIndex.from_documents(documents, embed_model=embed_model)
     
     # Persist index
     index_store.storage_context.persist(persist_dir=STORAGE_DIR)
@@ -235,6 +238,7 @@ def build_index(documents: List[Document]):
         similarity_top_k=3,
         response_mode="compact",
         text_qa_template=qa_prompt,
+        llm=llm,
     )
     
     return query_engine

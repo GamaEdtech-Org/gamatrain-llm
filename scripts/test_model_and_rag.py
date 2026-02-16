@@ -15,9 +15,12 @@ import requests
 import urllib3
 from datetime import datetime
 from llama_index.core import VectorStoreIndex, Document
-from llama_index.core import Settings
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+# Global models
+llm = None
+embed_model = None
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -53,10 +56,11 @@ def log_test(category, test_name, question, answer, passed, notes=""):
 
 
 def setup_llm():
+    global llm, embed_model
     print(f"Setting up LLM: {MODEL_NAME}")
-    Settings.llm = Ollama(model=MODEL_NAME, request_timeout=120.0)
-    Settings.embed_model = HuggingFaceEmbedding(model_name="intfloat/multilingual-e5-large")
-    return Settings.llm
+    llm = Ollama(model=MODEL_NAME, request_timeout=120.0)
+    embed_model = HuggingFaceEmbedding(model_name="intfloat/multilingual-e5-large")
+    return llm
 
 
 def fetch_api_data():
@@ -119,7 +123,7 @@ def build_test_index(blogs, schools):
             ))
     
     print(f"Building index with {len(documents)} documents...")
-    index = VectorStoreIndex.from_documents(documents)
+    index = VectorStoreIndex.from_documents(documents, embed_model=embed_model)
     
     # Configure query engine with strict context-only response
     from llama_index.core.prompts import PromptTemplate
@@ -140,6 +144,7 @@ def build_test_index(blogs, schools):
         similarity_top_k=3,
         response_mode="compact",
         text_qa_template=qa_prompt,
+        llm=llm,
     )
     return query_engine, documents
 

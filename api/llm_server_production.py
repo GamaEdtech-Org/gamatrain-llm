@@ -31,8 +31,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from llama_index.core import VectorStoreIndex, Document, Settings, StorageContext, load_index_from_storage
+from llama_index.core import VectorStoreIndex, Document, StorageContext, load_index_from_storage
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+# Global embedding model
+embed_model = None
 
 # =============================================================================
 # Configuration
@@ -273,8 +276,9 @@ async def stream_ollama_api(prompt: str, max_tokens: int = 1024):
 # =============================================================================
 def setup_embeddings():
     """Initialize embedding model (runs on CPU)."""
+    global embed_model
     logger.info("Setting up embedding model...")
-    Settings.embed_model = HuggingFaceEmbedding(
+    embed_model = HuggingFaceEmbedding(
         model_name="intfloat/multilingual-e5-large"
     )
     logger.info("Embedding model ready")
@@ -416,7 +420,7 @@ def build_index(documents: List[Document]):
     
     # Build new index
     logger.info(f"Building index with {len(documents)} documents...")
-    index_store = VectorStoreIndex.from_documents(documents)
+    index_store = VectorStoreIndex.from_documents(documents, embed_model=embed_model)
     index_store.storage_context.persist(persist_dir=STORAGE_DIR)
     query_engine = index_store.as_retriever(similarity_top_k=3)
     logger.info("Index built and saved")
