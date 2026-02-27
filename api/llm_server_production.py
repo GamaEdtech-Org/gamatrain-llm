@@ -25,7 +25,10 @@ import asyncio
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from collections import defaultdict
-from smart_response_formatter import QuestionClassifier, ResponseFormatter
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))  # Add parent directory to path
+from modules.smart_response_formatter import QuestionClassifier, ResponseFormatter
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,7 +41,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 
 # FAISS Integration
-from faiss_search_integration import (
+from modules.faiss_search_integration import (
     load_faiss_index, 
     add_faiss_endpoints,
     search_faiss,
@@ -718,7 +721,7 @@ Provide additional details and explanations:"""
     faiss_results = []
     if is_school_query and allow_sources:
         try:
-            from faiss_search_integration import search_faiss
+            from modules.faiss_search_integration import search_faiss
             faiss_results = search_faiss(search_query, k=5, min_score=0.3)
             logger.info(f"[OK] FAISS found {len(faiss_results)} schools")
         except Exception as e:
@@ -1467,3 +1470,5 @@ Answer based on the context above. Be specific and helpful."""
 # =============================================================================
 if __name__ == "__main__":
     uvicorn.run("llm_server_production:app", host=HOST, port=PORT, reload=False)
+
+
