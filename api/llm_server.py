@@ -194,60 +194,47 @@ def fetch_documents():
 
 def build_index(documents: List[Document]):
     """Build or load RAG index."""
-    global query_engine, index_store
+    global query_engine, index_store, embed_model
     
-    # Custom QA prompt to reduce hallucination
-    qa_prompt = PromptTemplate(
-        "Context information is below.\n"
-        "---------------------\n"
-        "{context_str}\n"
-        "---------------------\n"
-        "IMPORTANT: Answer the question ONLY using the context above. "
-        "If the answer is NOT in the context, say 'I don't have information about that in my knowledge base.' "
-        "Do NOT make up or invent any information.\n\n"
-        "Question: {query_str}\n"
-        "Answer: "
-    )
+    # CRITICAL: Make sure embed_model is set before loading/building index
+    if embed_model is None:
+        logger.error("Embed model not initialized! Call setup_embeddings() first.")
+        raise RuntimeError("Embed model not initialized")
     
-    # Try to load existing index
-    if os.path.exists(os.path.join(STORAGE_DIR, "docstore.json")):
+    # Check if index already exists
+    index_path = os.path.join(STORAGE_DIR, "docstore.json")
+    
+    if os.path.exists(index_path):
         try:
-            logger.info("Loading existing index from storage...")
-            storage_context = StorageContext.from_defaults(persist_dir=STORAGE_DIR)
-            index_store = load_index_from_storage(storage_context)
-            query_engine = index_store.as_query_engine(
-                similarity_top_k=3,
-                response_mode="compact",
-                text_qa_template=qa_prompt,
-                llm=llm,
+            logger.info("📦 Loading existing index from storage...")
+            storage_context = StorageContext.from_defaults(
+                persist_dir=STORAGE_DIR,
+                embed_model=embed_model
             )
-            logger.info("Index loaded successfully")
-            return query_engine
+            index_store = load_index_from_storage(
+                storage_context,
+                embed_model=embed_model
+            )
+            query_engine = index_store.as_retriever(similarity_top_k=3)
+            logger.info("✅ Index loaded successfully (no rebuild needed)")
+            return  # Exit early - no need to rebuild
         except Exception as e:
-            logger.warning(f"Could not load index: {e}, rebuilding...")
+            logger.warning(f"⚠️  Could not load index: {e}")
+            logger.info("🔨 Will rebuild index from scratch...")
+    else:
+        logger.info("📝 No existing index found, building new one...")
     
-    # Build new index
-    logger.info(f"Building new index with {len(documents)} documents...")
-    index_store = VectorStoreIndex.from_documents(documents, embed_model=embed_model)
-    
-    # Persist index
-    index_store.storage_context.persist(persist_dir=STORAGE_DIR)
-    logger.info(f"Index saved to {STORAGE_DIR}")
-    
-    query_engine = index_store.as_query_engine(
-        similarity_top_k=3,
-        response_mode="compact",
-        text_qa_template=qa_prompt,
-        llm=llm,
+    # Build new index (only if load failed or index doesn't exist)
+    logger.info(f"🔨 Building index with {len(documents)} documents...")
+    logger.info("Using HuggingFace embedding model (intfloat/multilingual-e5-large)")
+    index_store = VectorStoreIndex.from_documents(
+        documents, 
+        embed_model=embed_model,
+        show_progress=True
     )
-    
-    return query_engine
-
-
-# Similarity threshold for RAG
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.65"))  # Lowered from 0.75
-
-
+    index_store.storage_context.persist(persist_dir=STORAGE_DIR)
+    query_engine = index_store.as_retriever(similarity_top_k=3)
+    logger.info("✅ Index built and saved successfully")
 def filter_external_links(text: str) -> str:
     """Remove external links from response, keep only gamatrain.com links."""
     import re
@@ -418,7 +405,7 @@ User's follow-up question: {query_text}
 Continue explaining in detail:"""
             
             # Stream directly without RAG
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
                 async with client.stream(
                     "POST",
                     f"{OLLAMA_BASE_URL}/api/generate",
@@ -492,7 +479,7 @@ If the information above doesn't contain the answer, say so honestly."""
 {query_text}"""
                 
                 # Skip RAG retrieval, go directly to LLM
-                async with httpx.AsyncClient(timeout=120.0) as client:
+                async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
                     async with client.stream(
                         "POST",
                         f"{OLLAMA_BASE_URL}/api/generate",
@@ -586,7 +573,7 @@ Answer: """
             prompt = query_text
         
         # Stream from Ollama
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
             async with client.stream(
                 "POST",
                 f"{OLLAMA_BASE_URL}/api/generate",

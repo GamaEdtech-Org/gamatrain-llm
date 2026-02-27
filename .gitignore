@@ -40,3 +40,14 @@ gpg
 # Storage (regenerated on startup)
 storage/
 api/storage/
+
+# Backup files
+*.backup
+*.backup_*
+*~
+
+# FAISS index files (should be regenerated)
+*.index
+*_meta.pkl
+faiss_*.index
+faiss_*_meta.pkl

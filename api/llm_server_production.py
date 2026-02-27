@@ -25,6 +25,10 @@ import asyncio
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from collections import defaultdict
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))  # Add parent directory to path
+from modules.smart_response_formatter import QuestionClassifier, ResponseFormatter
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +37,16 @@ from pydantic import BaseModel
 
 from llama_index.core import VectorStoreIndex, Document, StorageContext, load_index_from_storage
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+
+
+# FAISS Integration
+from modules.faiss_search_integration import (
+    load_faiss_index, 
+    add_faiss_endpoints,
+    search_faiss,
+    FAISSSearchRequest
+)
 
 # Global embedding model
 embed_model = None
@@ -113,7 +127,7 @@ async def call_ollama_api(prompt: str, max_tokens: int = 1024):
     }
     
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
             response = await client.post(
                 f"{OLLAMA_BASE_URL}/api/generate",
                 json=payload
@@ -152,7 +166,7 @@ async def call_groq_api(prompt: str, max_tokens: int = 1024):
     }
     
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
             response = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers=headers,
@@ -191,7 +205,7 @@ async def call_openrouter_api(prompt: str, max_tokens: int = 1024):
     }
     
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
             response = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
@@ -251,7 +265,7 @@ async def stream_ollama_api(prompt: str, max_tokens: int = 1024):
     }
     
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
             async with client.stream(
                 "POST",
                 f"{OLLAMA_BASE_URL}/api/generate",
@@ -314,7 +328,7 @@ def fetch_documents():
     
     # Fetch blogs from API
     try:
-        with httpx.Client(verify=False, timeout=120) as client:
+        with httpx.Client(timeout=120, verify=False) as client:
             resp = client.get(
                 f"{API_BASE_URL}/blogs/posts",
                 params={"PagingDto.PageFilter.Size": 2000, "PagingDto.PageFilter.Skip": 0},
@@ -355,7 +369,7 @@ def fetch_documents():
         batch_size = 1000
         max_schools = 10000
         
-        with httpx.Client(verify=False, timeout=120) as client:
+        with httpx.Client(timeout=120, verify=False) as client:
             for skip in range(0, max_schools, batch_size):
                 resp = client.get(
                     f"{API_BASE_URL}/schools",
@@ -411,103 +425,35 @@ def build_index(documents: List[Document]):
         logger.error("Embed model not initialized! Call setup_embeddings() first.")
         raise RuntimeError("Embed model not initialized")
     
-    # Try to load existing index
-    if os.path.exists(os.path.join(STORAGE_DIR, "docstore.json")):
-        try:
-            logger.info("Loading existing index...")
-            storage_context = StorageContext.from_defaults(
-                persist_dir=STORAGE_DIR,
-                embed_model=embed_model  # CRITICAL: Pass embed_model when loading
-            )
-            index_store = load_index_from_storage(
-                storage_context,
-                embed_model=embed_model  # CRITICAL: Pass embed_model when loading
-            )
-            query_engine = index_store.as_retriever(similarity_top_k=3)
-            logger.info("Index loaded successfully with HuggingFace embeddings")
-            return
-        except Exception as e:
-            logger.warning(f"Could not load index: {e}")
-            logger.info("Will rebuild index from scratch...")
+    # Check if index already exists
+    index_path = os.path.join(STORAGE_DIR, "docstore.json")
     
-    # Build new index
-    logger.info(f"Building index with {len(documents)} documents...")
+    if os.path.exists(index_path):
+        try:
+            logger.info(" Loading existing index from storage...")
+            storage_context = StorageContext.from_defaults(persist_dir=STORAGE_DIR)
+            index_store = load_index_from_storage(
+                storage_context)
+            query_engine = index_store.as_retriever(similarity_top_k=3)
+            logger.info("[OK] Index loaded successfully (no rebuild needed)")
+            return  # Exit early - no need to rebuild
+        except Exception as e:
+            logger.warning(f"[WARNING]  Could not load index: {e}")
+            logger.info(" Will rebuild index from scratch...")
+    else:
+        logger.info(" No existing index found, building new one...")
+    
+    # Build new index (only if load failed or index doesn't exist)
+    logger.info(f" Building index with {len(documents)} documents...")
     logger.info("Using HuggingFace embedding model (intfloat/multilingual-e5-large)")
     index_store = VectorStoreIndex.from_documents(
         documents, 
-        embed_model=embed_model,  # CRITICAL: Use HuggingFace, not OpenAI
+        embed_model=embed_model,
         show_progress=True
     )
     index_store.storage_context.persist(persist_dir=STORAGE_DIR)
     query_engine = index_store.as_retriever(similarity_top_k=3)
-    logger.info("Index built and saved successfully")
-
-
-async def rewrite_query_with_context(query: str, history: list) -> tuple:
-    """Rewrite follow-up questions to include context. Returns (rewritten_query, is_follow_up)."""
-    if not history:
-        return query, False
-    
-    query_lower = query.lower().strip()
-    
-    # Check for explicit follow-up phrases first
-    explicit_followup_phrases = ["tell me more", "explain more", "can you explain", "more details", 
-                                  "more information", "go on", "continue", "elaborate"]
-    is_explicit = any(phrase in query_lower for phrase in explicit_followup_phrases)
-    
-    if is_explicit:
-        # For explicit follow-ups, use the last topic directly
-        last_entry = history[-1]
-        last_topic = last_entry.get("topic", last_entry.get("query", ""))
-        logger.info(f"Explicit follow-up detected about: {last_topic[:50]}...")
-        return f"Explain more about {last_topic}", True
-    
-    # Check for follow-up indicators (pronouns)
-    follow_up_words = ["it", "its", "this", "that", "they", "their", "there", "here"]
-    
-    # Check if query contains follow-up words as separate words
-    query_words = query_lower.replace("?", " ").replace(".", " ").split()
-    has_follow_up = any(word in query_words for word in follow_up_words)
-    
-    if not has_follow_up:
-        return query, False
-    
-    # Get the last topic
-    last_entry = history[-1]
-    last_topic = last_entry.get("topic", "")
-    
-    if not last_topic:
-        # Try to extract from last query
-        last_query = last_entry.get("query", "")
-        # Simple extraction: look for capitalized words
-        words = last_query.split()
-        topic_words = [w for w in words if w[0].isupper() and len(w) > 2] if words else []
-        if topic_words:
-            last_topic = " ".join(topic_words[:4])  # Max 4 words
-    
-    if not last_topic:
-        return query, False
-    
-    # Rewrite the query by replacing pronouns with the topic
-    rewritten = query
-    replacements = [
-        (" it ", f" {last_topic} "),
-        (" it?", f" {last_topic}?"),
-        (" its ", f" {last_topic}'s "),
-        ("does it ", f"does {last_topic} "),
-        ("is it ", f"is {last_topic} "),
-        ("what is it", f"what is {last_topic}"),
-    ]
-    
-    for old, new in replacements:
-        if old in query_lower:
-            rewritten = query_lower.replace(old, new)
-            break
-    
-    logger.info(f"Query rewritten: '{query}' -> '{rewritten}' (topic: {last_topic})")
-    return rewritten, True
-
-
+    logger.info("[OK] Index built and saved successfully")
 def filter_external_links(text: str) -> str:
     """Remove external links from response, keep only gamatrain.com links."""
     import re
@@ -580,6 +526,49 @@ def extract_source_links(nodes, base_url: str = "https://gamatrain.com"):
     
     return sources
 
+def extract_faiss_source_links(faiss_results, base_url: str = "https://gamatrain.com"):
+    """Extract school links from FAISS results with correct URLs."""
+    sources = []
+    
+    for result in faiss_results[:3]:  # Top 3 results
+        school_id = result.get('school_id')
+        text = result.get('text', '')
+        score = result.get('similarity_score', 0)
+        
+        # Extract school name from text
+        school_name = ""
+        if "School:" in text:
+            school_name = text.split("School:")[1].split(".")[0].strip()
+        
+        # Extract slug from text (if available)
+        slug = ""
+        if "URL: /schools/" in text:
+            slug = text.split("URL: /schools/")[1].split()[0].strip()
+        
+        # Build correct URL
+        if school_id and slug:
+            # Correct format: /school/{id}/{slug}
+            url = f"{base_url}/school/{school_id}/{slug}"
+            
+            sources.append({
+                "type": "school",
+                "title": school_name or f"School {school_id}",
+                "url": url,
+                "score": score
+            })
+        elif school_id:
+            # Fallback: just use ID
+            url = f"{base_url}/school/{school_id}"
+            sources.append({
+                "type": "school",
+                "title": school_name or f"School {school_id}",
+                "url": url,
+                "score": score
+            })
+    
+    return sources
+
+
 
 def format_sources_text(sources):
     """Don't format sources as text - frontend will handle all source display."""
@@ -591,8 +580,74 @@ def format_sources_text(sources):
 # =============================================================================
 # Query Processing (with RAG + Memory + Follow-up)
 # =============================================================================
+
+async def rewrite_query_with_context(query: str, history: list) -> tuple:
+    """Rewrite follow-up questions to include context. Returns (rewritten_query, is_follow_up)."""
+    if not history:
+        return query, False
+    
+    query_lower = query.lower().strip()
+    
+    # Check for explicit follow-up phrases first
+    explicit_followup_phrases = ["tell me more", "explain more", "can you explain", "more details", 
+                                  "more information", "go on", "continue", "elaborate"]
+    is_explicit = any(phrase in query_lower for phrase in explicit_followup_phrases)
+    
+    if is_explicit:
+        # For explicit follow-ups, use the last topic directly
+        last_entry = history[-1]
+        last_topic = last_entry.get("topic", last_entry.get("query", ""))
+        logger.info(f"Explicit follow-up detected about: {last_topic[:50]}...")
+        return f"Explain more about {last_topic}", True
+    
+    # Check for follow-up indicators (pronouns)
+    follow_up_words = ["it", "its", "this", "that", "they", "their", "there", "here"]
+    
+    # Check if query contains follow-up words as separate words
+    query_words = query_lower.replace("?", " ").replace(".", " ").split()
+    has_follow_up = any(word in query_words for word in follow_up_words)
+    
+    if not has_follow_up:
+        return query, False
+    
+    # Get the last topic
+    last_entry = history[-1]
+    last_topic = last_entry.get("topic", "")
+    
+    if not last_topic:
+        # Try to extract from last query
+        last_query = last_entry.get("query", "")
+        # Simple extraction: look for capitalized words
+        words = last_query.split()
+        topic_words = [w for w in words if w[0].isupper() and len(w) > 2] if words else []
+        if topic_words:
+            last_topic = " ".join(topic_words[:4])  # Max 4 words
+    
+    if not last_topic:
+        return query, False
+    
+    # Rewrite the query by replacing pronouns with the topic
+    rewritten = query
+    replacements = [
+        (" it ", f" {last_topic} "),
+        (" it?", f" {last_topic}?"),
+        (" its ", f" {last_topic}'s "),
+        ("does it ", f"does {last_topic} "),
+        ("is it ", f"is {last_topic} "),
+        ("what is it", f"what is {last_topic}"),
+    ]
+    
+    for old, new in replacements:
+        if old in query_lower:
+            rewritten = query_lower.replace(old, new)
+            break
+    
+    logger.info(f"Query rewritten: '{query}' -> '{rewritten}' (topic: {last_topic})")
+    return rewritten, True
+
+
 async def process_query(query_text: str, session_id: str = "default", use_rag: bool = True):
-    """Process query with RAG, memory, and follow-up detection."""
+    """Process query with RAG, memory, follow-up detection, and FAISS for schools."""
     global index_store, conversation_memory
     
     query_lower = query_text.lower().strip()
@@ -601,7 +656,7 @@ async def process_query(query_text: str, session_id: str = "default", use_rag: b
     
     history = conversation_memory[session_id]
 
-    # Detect general greetings (English only)
+    # Detect general greetings
     general_patterns = ['hi', 'hello', 'hey', 'good morning', 'good evening', 'how are you',
                         'what can you do', 'who are you', 'help', 'thanks', 'thank you',
                         'bye', 'goodbye', 'ok', 'okay', 'yes', 'no', 'sure', "i'm not sure"]
@@ -609,11 +664,11 @@ async def process_query(query_text: str, session_id: str = "default", use_rag: b
 
     if is_general:
         prompt = f"You are Gamatrain AI, a friendly educational assistant. Respond briefly: {query_text}"
-        return prompt, None
+        return prompt, None, []
 
-    # Check for explicit follow-up phrases
-    follow_up_words = ["that", "this", "it", "those", "these", "more", "explain", "elaborate", "details", "different", "same", "similar", "compare", "versus", "vs"]
-    follow_up_phrases = ["tell me more", "explain more", "can you explain", "what about", "how about", "also", "continue", "go on"]
+    # Check for follow-up
+    follow_up_words = ["that", "this", "it", "those", "these", "more", "explain", "elaborate", "details"]
+    follow_up_phrases = ["tell me more", "explain more", "can you explain", "what about", "how about"]
     is_follow_up_check = history and (any(word in query_normalized.split() for word in follow_up_words) or any(phrase in query_lower for phrase in follow_up_phrases))
     
     link_keywords = ["link", "links", "source", "sources", "reference", "references"]
@@ -622,12 +677,11 @@ async def process_query(query_text: str, session_id: str = "default", use_rag: b
     
     allow_sources = explicit_link_request or (not is_general and not is_follow_up_check)
     
-    # Check for explicit follow-up phrases
+    # Explicit follow-ups
     explicit_followup_phrases = ["tell me more", "explain more", "can you explain", "more details", 
                                   "more information", "go on", "continue", "elaborate"]
     is_explicit_followup = any(phrase in query_lower for phrase in explicit_followup_phrases)
     
-    # For explicit follow-ups, use conversation history directly
     if is_explicit_followup and history:
         last_entry = history[-1]
         last_query = last_entry.get("query", "")
@@ -648,9 +702,9 @@ User's follow-up: {query_text}
 
 Provide additional details and explanations:"""
         
-        return prompt, last_topic
+        return prompt, last_topic, []
     
-    # Use LLM to rewrite query if there's conversation history
+    # Rewrite query if needed
     search_query = query_text
     is_follow_up = False
     if history:
@@ -658,42 +712,71 @@ Provide additional details and explanations:"""
     
     logger.info(f"Query: {query_text}, Rewritten: {search_query}, Follow-up: {is_follow_up}")
     
-    # Use RAG with the rewritten query
+    # [OK] NEW: Detect school-related queries
+    school_keywords = ["school", "university", "college", "academy", "institute", "campus",
+                       "مدرسه", "دانشگاه", "آموزشگاه", "دانشکده"]
+    is_school_query = any(keyword in query_lower for keyword in school_keywords)
+    
+    # [OK] NEW: Try FAISS first for school queries
+    faiss_results = []
+    if is_school_query and allow_sources:
+        try:
+            from modules.faiss_search_integration import search_faiss
+            faiss_results = search_faiss(search_query, k=5, min_score=0.3)
+            logger.info(f"[OK] FAISS found {len(faiss_results)} schools")
+        except Exception as e:
+            logger.warning(f"FAISS search failed: {e}")
+    
+    # Use RAG
     if allow_sources and use_rag and index_store:
         retriever = index_store.as_retriever(similarity_top_k=3)
-        nodes = retriever.retrieve(search_query)  # Use rewritten query for search
+        nodes = retriever.retrieve(search_query)
         
         if nodes and max([n.score for n in nodes]) >= SIMILARITY_THRESHOLD:
-            context = "\n".join([n.text for n in nodes[:3]])
+            # [OK] Combine FAISS and RAG results
+            context = ""
             
-            prompt = f"""Context:
-{context}
-
-Question: {query_text}
-
-Answer based on the context above. Be specific and include exact numbers if available (like scores, ratings, etc.). If the answer is not in the context, say so."""
+            if faiss_results:
+                context += "[OK] Schools found:\n"
+                for r in faiss_results[:3]:
+                    context += f"- {r['text']}\n"
+                context += "\n"
             
-            # Extract topic (for blogs and schools)
+            if nodes:
+                context += "[OK] Additional information:\n"
+                context += "\n".join([n.text for n in nodes[:3]])
+            
+            # [OK] Detect question type and format prompt accordingly
+            question_type = QuestionClassifier.classify(query_text)
+            logger.info(f"Question type: {question_type}")
+            
+            prompt = ResponseFormatter.format_prompt_smart(query_text, context, question_type)
+            
+            # Extract topic
             topic = ""
-            best_node = max(nodes, key=lambda n: n.score)
-            if "Blog Title:" in best_node.text:
-                topic = best_node.text.split("Blog Title:")[1].split("\n")[0].strip()
-            elif "School Name:" in best_node.text:
-                topic = best_node.text.split("School Name:")[1].split("\n")[0].strip()
+            if faiss_results:
+                text = faiss_results[0]['text']
+                if "School:" in text:
+                    topic = text.split("School:")[1].split(".")[0].strip()
+            elif nodes:
+                best_node = max(nodes, key=lambda n: n.score)
+                if "Blog Title:" in best_node.text:
+                    topic = best_node.text.split("Blog Title:")[1].split("\n")[0].strip()
+                elif "School Name:" in best_node.text:
+                    topic = best_node.text.split("School Name:")[1].split("\n")[0].strip()
             
-            return prompt, topic
+            return prompt, topic, faiss_results
     
-    # Fallback to direct question
+    # Fallback
     prompt = f"You are Gamatrain AI, an educational assistant. Answer: {query_text}"
-    return prompt, None
-
+    return prompt, None, []
 
 async def stream_query(query_text: str, session_id: str = "default", use_rag: bool = True):
     """Stream response with RAG, memory, and source citations."""
     global conversation_memory
     
     # Process query
-    prompt, topic = await process_query(query_text, session_id, use_rag)
+    prompt, topic, faiss_results = await process_query(query_text, session_id, use_rag)
     
     # Detect if sources should be allowed
     q_low = query_text.lower().strip()
@@ -726,6 +809,14 @@ async def stream_query(query_text: str, session_id: str = "default", use_rag: bo
             if nodes and max([n.score for n in nodes]) >= SIMILARITY_THRESHOLD:
                 # Extract sources, but filter out irrelevant ones
                 all_sources = extract_source_links(nodes)
+                
+                # [OK] Add FAISS sources if available
+                if faiss_results:
+                    faiss_sources = extract_faiss_source_links(faiss_results)
+                    # Replace RAG sources with FAISS sources for school queries
+                    if faiss_sources:
+                        sources = faiss_sources
+                        logger.info(f"Using {len(sources)} FAISS sources")
                 
                 # Smart filtering: prioritize blogs over schools for educational content
                 blog_sources = [s for s in all_sources if s["type"] == "blog"]
@@ -813,13 +904,37 @@ async def lifespan(app: FastAPI):
         logger.warning("OPENROUTER_API_KEY not set!")
     
     setup_embeddings()
-    documents = fetch_documents()
-    build_index(documents)
+    
+    # Check if index exists before fetching documents
+    index_path = os.path.join(STORAGE_DIR, "docstore.json")
+    
+    if os.path.exists(index_path):
+        logger.info(" Existing index found, loading...")
+        try:
+            storage_context = StorageContext.from_defaults(persist_dir=STORAGE_DIR)
+            index_store = load_index_from_storage(storage_context)
+            query_engine = index_store.as_retriever(similarity_top_k=3)
+            logger.info("[OK] Index loaded successfully")
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to load index: {e}")
+            logger.info(" Fetching documents and rebuilding...")
+            documents = fetch_documents()
+            build_index(documents)  # Empty list - will just load existing index
+    else:
+        logger.info(" Fetching documents from API...")
+        documents = fetch_documents()
+        build_index(documents)
+    
+    # ✨ NEW: Load FAISS index
+    faiss_loaded = load_faiss_index()
+    if faiss_loaded:
+        logger.info("[OK]  FAISS search enabled")
+    else:
+        logger.warning("[WARNING]  FAISS search disabled (index not found)")
     
     logger.info("Server ready!")
     yield
     logger.info("Shutting down...")
-
 
 app = FastAPI(
     title="Gamatrain AI API",
@@ -835,6 +950,54 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ✨ Add FAISS endpoints
+add_faiss_endpoints(app)
+
+
+async def enhanced_search(query_text: str, use_faiss: bool = True, use_rag: bool = True):
+    """
+    جستجوی پیشرفته با ترکیب FAISS و RAG.
+    
+    - FAISS: برای جستجوی سریع مدارس
+    - RAG: برای بلاگ‌ها و اطلاعات عمومی
+    """
+    results = {
+        "faiss_schools": [],
+        "rag_content": [],
+        "combined_context": ""
+    }
+    
+    # 1. جستجو در FAISS برای مدارس
+    if use_faiss:
+        try:
+            faiss_results = search_faiss(query_text, k=3, min_score=0.3)
+            results["faiss_schools"] = faiss_results
+            
+            if faiss_results:
+                results["combined_context"] += " Schools found:\n"
+                for r in faiss_results[:3]:
+                    results["combined_context"] += f"- {r['text']}\n"
+                results["combined_context"] += "\n"
+        except Exception as e:
+            logger.warning(f"FAISS search failed: {e}")
+    
+    # 2. جستجو در RAG برای محتوای عمومی
+    if use_rag and index_store:
+        try:
+            retriever = index_store.as_retriever(similarity_top_k=3)
+            nodes = retriever.retrieve(query_text)
+            
+            if nodes and max([n.score for n in nodes]) >= SIMILARITY_THRESHOLD:
+                results["rag_content"] = nodes
+                
+                results["combined_context"] += "📚 Additional information:\n"
+                for node in nodes[:3]:
+                    results["combined_context"] += f"- {node.text[:200]}...\n"
+        except Exception as e:
+            logger.warning(f"RAG search failed: {e}")
+    
+    return results
 
 
 # =============================================================================
@@ -863,6 +1026,13 @@ class ChatRequest(BaseModel):
     stream: bool = True
     session_id: str = "default"
     use_rag: bool = True
+
+
+class EnhancedSearchRequest(BaseModel):
+    query: str
+    use_faiss: bool = True
+    use_rag: bool = True
+    generate_response: bool = True
 
 
 # =============================================================================
@@ -1084,7 +1254,7 @@ async def list_blogs(search: str = ""):
     headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
     
     try:
-        with httpx.Client(verify=False, timeout=120) as client:
+        with httpx.Client(timeout=120, verify=False) as client:
             resp = client.get(
                 f"{API_BASE_URL}/blogs/posts",
                 params={"PagingDto.PageFilter.Size": 2000, "PagingDto.PageFilter.Skip": 0},
@@ -1115,7 +1285,7 @@ async def list_blogs(search: str = ""):
     headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
     
     try:
-        with httpx.Client(verify=False, timeout=120) as client:
+        with httpx.Client(timeout=120, verify=False) as client:
             resp = client.get(
                 f"{API_BASE_URL}/blogs/posts",
                 params={"PagingDto.PageFilter.Size": 2000, "PagingDto.PageFilter.Skip": 0},
@@ -1239,9 +1409,66 @@ async def search_schools(q: str, limit: int = 5):
         logger.error(f"School search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/v1/search/enhanced")
+async def enhanced_search_endpoint(request: EnhancedSearchRequest):
+    """
+    جستجوی پیشرفته با ترکیب FAISS و RAG.
+    
+    Example:
+        POST /v1/search/enhanced
+        {
+            "query": "best schools in Tehran for computer science",
+            "use_faiss": true,
+            "use_rag": true,
+            "generate_response": true
+        }
+    """
+    if not request.query or len(request.query.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Query too short")
+    
+    try:
+        # جستجو
+        search_results = await enhanced_search(
+            request.query, 
+            request.use_faiss, 
+            request.use_rag
+        )
+        
+        response_data = {
+            "query": request.query,
+            "schools": search_results["faiss_schools"],
+            "rag_sources": [
+                {
+                    "text": node.text[:200],
+                    "score": node.score,
+                    "metadata": node.metadata
+                }
+                for node in search_results["rag_content"]
+            ] if search_results["rag_content"] else []
+        }
+        
+        # تولید پاسخ با LLM (اختیاری)
+        if request.generate_response and search_results["combined_context"]:
+            prompt = f"""Context:
+{search_results["combined_context"]}
+
+Question: {request.query}
+
+Answer based on the context above. Be specific and helpful."""
+            
+            llm_response = await call_llm_api(prompt, MAX_TOKENS)
+            response_data["generated_response"] = llm_response
+        
+        return response_data
+        
+    except Exception as e:
+        logger.error(f"Enhanced search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
 # Main
 # =============================================================================
 if __name__ == "__main__":
     uvicorn.run("llm_server_production:app", host=HOST, port=PORT, reload=False)
+
+
