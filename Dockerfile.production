@@ -17,9 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY api/llm_server_production.py .
 COPY data/ ./data/
-
-# Create empty storage directory (will be populated on first run)
-RUN mkdir -p /app/storage
+RUN mkdir -p ./storage/
 
 # Environment variables
 ENV HOST=0.0.0.0
